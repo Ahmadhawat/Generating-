@@ -1,0 +1,585 @@
+Awesome—here’s a single, production-ready Python script that:
+
+walks a folder of .htm/.html files,
+
+cleans each page (drops CSS/JS/comments, trims noisy attributes, compresses wrappers),
+
+builds a block tree (~256 words per block),
+
+creates passage embeddings with intfloat/multilingual-e5-base,
+
+writes a FAISS index (IndexFlatIP, cosine-sim ready) and a SQLite metadata DB with your exact schema.
+
+
+You can drop this into a file like build_html_vector_db.py and run it.
+
+
+---
+
+Quick start
+
+pip install beautifulsoup4 lxml sentence-transformers faiss-cpu numpy tqdm html5lib
+python build_html_vector_db.py /path/to/html_folder --out ./vector_db --max_words 256
+
+This creates:
+
+vector_db/index.faiss – FAISS vectors (normalized for cosine via inner product)
+
+vector_db/metadata.db – SQLite with one row per block (schema below)
+
+vector_db/stats.json – simple ingest stats
+
+
+
+---
+
+The code
+
+#!/usr/bin/env python3
+# build_html_vector_db.py
+import argparse
+import os
+import re
+import json
+import time
+import sqlite3
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from tqdm import tqdm
+import numpy as np
+
+# Embeddings
+from sentence_transformers import SentenceTransformer
+import faiss  # pip install faiss-cpu
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+SAFE_ATTRS = {"href", "src", "alt", "title"}
+WORD_SPLIT_RE = re.compile(r"\w+([’'\-]\w+)*", re.UNICODE)
+
+def word_count(text: str) -> int:
+    return len(WORD_SPLIT_RE.findall(text)) if text else 0
+
+def estimate_tokens_from_words(words: int) -> int:
+    # loose heuristic; adjust if you want model-specific estimates
+    return int(round(words * 1.3))
+
+def file_timestamp(path: Path) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime))
+
+def read_file_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+def normalize_vecs(vecs: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+    return vecs / norms
+
+# -----------------------------
+# HTML Cleaning
+# -----------------------------
+
+def remove_scripts_styles_comments(soup: BeautifulSoup) -> None:
+    for elem in soup(["script", "style", "noscript"]):
+        elem.decompose()
+    for c in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        c.extract()
+
+def strip_noisy_attributes(soup: BeautifulSoup) -> None:
+    # Keep only SAFE_ATTRS; drop event handlers and data-* trackers
+    for tag in soup.find_all(True):
+        attrs = dict(tag.attrs)  # copy
+        for k in list(attrs.keys()):
+            kl = k.lower()
+            if kl in SAFE_ATTRS:
+                continue
+            if kl.startswith("on"):   # onclick, onload...
+                del tag.attrs[k]
+            elif kl.startswith("data-"):
+                del tag.attrs[k]
+            else:
+                # Remove most other attrs (class/id often huge from frameworks)
+                del tag.attrs[k]
+
+def remove_empty_tags(soup: BeautifulSoup) -> None:
+    # Iteratively remove tags with no text and no <img> or <a> content
+    changed = True
+    while changed:
+        changed = False
+        for tag in list(soup.find_all(True)):
+            if tag.name in ("img", "br", "hr"):  # keep
+                continue
+            # If tag has no meaningful text and no child tags with content
+            text = tag.get_text(strip=True)
+            has_media = tag.find(["img", "video", "audio"])
+            if not text and not has_media:
+                # keep anchors with href even if empty? Usually no.
+                if tag.name == "a" and tag.get("href"):
+                    continue
+                tag.decompose()
+                changed = True
+
+def unwrap_single_wrappers(soup: BeautifulSoup, max_passes: int = 2) -> None:
+    # Merge chains like <div><div><p>...</p></div></div> -> keep inner
+    # Be conservative: only unwrap div/span/section/article with 1 child
+    candidates = {"div", "span", "section", "article", "main", "header", "footer", "aside", "nav"}
+    for _ in range(max_passes):
+        changed = False
+        for tag in list(soup.find_all(candidates)):
+            # if single element child and no text nodes around
+            children = [c for c in tag.contents if isinstance(c, (Tag, NavigableString))]
+            # If exactly 1 child and it's a Tag, with no text siblings
+            if len(children) == 1 and isinstance(children[0], Tag):
+                # ensure no leading/trailing text
+                if (not tag.text.strip()) or (tag.text.strip() == children[0].text.strip()):
+                    tag.unwrap()
+                    changed = True
+        if not changed:
+            break
+
+def clean_html(html: str) -> BeautifulSoup:
+    soup = BeautifulSoup(html, "lxml")  # fast + lenient
+    remove_scripts_styles_comments(soup)
+    strip_noisy_attributes(soup)
+    remove_empty_tags(soup)
+    unwrap_single_wrappers(soup, max_passes=2)
+    return soup
+
+# -----------------------------
+# Block Tree Construction
+# -----------------------------
+
+def node_text(n: Tag) -> str:
+    # Extract visible text but not from script/style (already removed)
+    return n.get_text(separator=" ", strip=True)
+
+def element_word_count(n: Tag) -> int:
+    return word_count(node_text(n))
+
+def path_with_indices(node: Tag) -> str:
+    path_segments = []
+    cur = node
+    while cur and isinstance(cur, Tag):
+        parent = cur.parent if isinstance(cur.parent, Tag) else None
+        if parent:
+            # index among siblings with same name, 1-based
+            same = [c for c in parent.find_all(cur.name, recursive=False)]
+            idx = same.index(cur) + 1 if cur in same else 1
+            seg = f"<{cur.name}{idx}>"
+        else:
+            seg = f"<{cur.name}>"
+        path_segments.append(seg)
+        cur = parent
+    return "".join(reversed(path_segments))
+
+def nearest_title(soup: BeautifulSoup) -> str:
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+    h1 = soup.find("h1")
+    return h1.get_text(strip=True) if h1 else ""
+
+def collect_headers_trail(node: Tag) -> List[str]:
+    # Inside a block, collect visible h1/h2 text to serve as a quick trail
+    headers = []
+    for h in node.find_all(["h1", "h2"]):
+        t = h.get_text(strip=True)
+        if t:
+            headers.append(t)
+    return headers[:6]  # cap
+
+def chunk_long_paragraph(text: str, max_words: int) -> List[str]:
+    words = WORD_SPLIT_RE.findall(text)
+    if not words:
+        return []
+    chunks = []
+    start = 0
+    n = len(words)
+    while start < n:
+        end = min(start + max_words, n)
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        start = end
+    return chunks
+
+def build_blocks(root: Tag, max_words: int) -> List[Dict]:
+    """
+    Structural, query-agnostic block building:
+      - If a node's total words <= max_words, emit 1 block for its subtree.
+      - Else, recurse into children; if a leaf still too long (e.g., big <p>), split by words.
+    """
+    blocks = []
+
+    def recurse(node: Tag, parent_id: Optional[int]) -> List[int]:
+        nonlocal blocks
+        if not isinstance(node, Tag):
+            return []
+
+        total_words = element_word_count(node)
+
+        # If short enough, emit as a single block
+        if total_words <= max_words and total_words > 0:
+            block_id = len(blocks)
+            html_clean = str(node)  # subtree HTML
+            text = node_text(node)
+            headers = collect_headers_trail(node)
+            blocks.append({
+                "block_id": block_id,
+                "parent_id": parent_id,
+                "children_ids": [],
+                "block_path": path_with_indices(node),
+                "html_clean": html_clean,
+                "text": text,
+                "headers": headers,
+                "token_estimate": estimate_tokens_from_words(total_words),
+                "_node_ref": node,  # temporary, to wire children later
+            })
+            return [block_id]
+
+        # Too big: try to split by child elements
+        child_block_ids = []
+        child_tags = [c for c in node.children if isinstance(c, Tag)]
+        if child_tags:
+            this_block_id = None
+            # Create a synthetic non-emitting wrapper? We won't store the wrapper itself,
+            # only its children as blocks. To keep parent links, we still need a parent_id reference.
+            # We'll use parent_id passed in; children will link to that parent.
+            for ch in child_tags:
+                ch_ids = recurse(ch, parent_id)  # keep same parent for flattened structure
+                child_block_ids.extend(ch_ids)
+
+            return child_block_ids
+
+        # Leaf but still huge (e.g., a massive <p>): chunk by words
+        if total_words > max_words:
+            paragraphs = chunk_long_paragraph(node_text(node), max_words)
+            new_ids = []
+            for chunk in paragraphs:
+                block_id = len(blocks)
+                # Wrap chunk in a <p> to keep valid HTML
+                html_clean = f"<p>{chunk}</p>"
+                headers = collect_headers_trail(node)
+                blocks.append({
+                    "block_id": block_id,
+                    "parent_id": parent_id,
+                    "children_ids": [],
+                    "block_path": path_with_indices(node) + "<chunk>",
+                    "html_clean": html_clean,
+                    "text": chunk,
+                    "headers": headers,
+                    "token_estimate": estimate_tokens_from_words(word_count(chunk)),
+                    "_node_ref": None
+                })
+                new_ids.append(block_id)
+            return new_ids
+
+        return []
+
+    # Use <body> if present; else start at root <html>
+    start_node = root.find("body") or root
+    recurse(start_node, parent_id=None)
+
+    # Parent/children wiring:
+    # We flattened big parents; we’ll infer parent links by DOM ancestry where possible:
+    node_to_blockids: Dict[Tag, List[int]] = {}
+    for b in blocks:
+        ref = b["_node_ref"]
+        if ref is not None:
+            node_to_blockids.setdefault(ref, []).append(b["block_id"])
+
+    # build a mapping: for each block, find nearest ancestor that also emitted a block
+    def nearest_ancestor_block(node: Tag) -> Optional[int]:
+        cur = node.parent
+        while isinstance(cur, Tag):
+            ids = node_to_blockids.get(cur)
+            if ids:
+                return ids[0]
+            cur = cur.parent
+        return None
+
+    for b in blocks:
+        ref = b["_node_ref"]
+        if ref is not None:
+            pid = nearest_ancestor_block(ref)
+            b["parent_id"] = pid
+
+    # children_ids
+    id_to_children: Dict[int, List[int]] = {b["block_id"]: [] for b in blocks}
+    for b in blocks:
+        pid = b["parent_id"]
+        if pid is not None and pid in id_to_children:
+            id_to_children[pid].append(b["block_id"])
+    for b in blocks:
+        b["children_ids"] = id_to_children[b["block_id"]]
+
+    # cleanup temp refs
+    for b in blocks:
+        b.pop("_node_ref", None)
+
+    return blocks
+
+# -----------------------------
+# Storage (SQLite + FAISS)
+# -----------------------------
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS blocks (
+    row_id INTEGER PRIMARY KEY,               -- row order matches FAISS vector id
+    doc_id TEXT NOT NULL,
+    url TEXT,
+    title TEXT,
+
+    block_id INTEGER NOT NULL,
+    parent_id INTEGER,
+    children_ids TEXT,                        -- JSON array
+
+    block_path TEXT,
+    html_clean TEXT,
+    text TEXT,
+    headers TEXT,                             -- JSON array
+    token_estimate INTEGER,
+    timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_doc ON blocks(doc_id);
+CREATE INDEX IF NOT EXISTS idx_block ON blocks(block_id);
+"""
+
+def init_sqlite(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.executescript(SCHEMA_SQL)
+    return conn
+
+def insert_block(conn: sqlite3.Connection, row: Dict):
+    conn.execute(
+        """
+        INSERT INTO blocks(
+            doc_id, url, title,
+            block_id, parent_id, children_ids,
+            block_path, html_clean, text, headers, token_estimate, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["doc_id"], row.get("url"), row.get("title"),
+            row["block_id"], row.get("parent_id"),
+            json.dumps(row.get("children_ids", []), ensure_ascii=False),
+            row.get("block_path"), row.get("html_clean"), row.get("text"),
+            json.dumps(row.get("headers", []), ensure_ascii=False),
+            int(row.get("token_estimate", 0)), row.get("timestamp"),
+        )
+    )
+
+# -----------------------------
+# Embedding Model
+# -----------------------------
+
+class E5Embedder:
+    """
+    E5 uses instruction prefixes. For passages, use 'passage: ' prefix.
+    Model: intfloat/multilingual-e5-base (768-dim)
+    """
+    def __init__(self, device: Optional[str] = None):
+        self.model = SentenceTransformer("intfloat/multilingual-e5-base", device=device)
+
+    def encode_passages(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
+        prefixed = [f"passage: {t.strip()}" if t else "passage: " for t in texts]
+        emb = self.model.encode(
+            prefixed,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=False,  # we will normalize explicitly
+        )
+        return emb
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
+
+def process_html_file(path: Path, max_words: int) -> Tuple[str, str, List[Dict]]:
+    raw = read_file_text(path)
+    soup = clean_html(raw)
+
+    # doc-level info
+    title = nearest_title(soup)
+    url = None
+    # Optional: respect <base href> or data-canonical
+    base = soup.find("base")
+    if base and base.get("href"):
+        url = base.get("href")
+    canonical = soup.find("link", rel=lambda v: v and "canonical" in v)
+    if canonical and canonical.get("href"):
+        url = canonical.get("href")
+    if url is None:
+        url = str(path.resolve().as_uri())
+
+    # Build blocks
+    blocks = build_blocks(soup, max_words=max_words)
+    return url, title, blocks
+
+def build_vector_db(input_dir: Path, out_dir: Path, max_words: int = 256, batch_size: int = 64, device: Optional[str] = None):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    db_path = out_dir / "metadata.db"
+    faiss_path = out_dir / "index.faiss"
+    stats_path = out_dir / "stats.json"
+
+    conn = init_sqlite(db_path)
+    embedder = E5Embedder(device=device)
+
+    # Prepare FAISS index
+    # Peek one embedding to know dimensionality lazily if needed, but E5 base = 768
+    dim = 768
+    index = faiss.IndexFlatIP(dim)  # inner product; we will L2-normalize vectors
+
+    all_vecs = []
+    total_blocks = 0
+    total_files = 0
+    files = sorted(
+        [p for p in input_dir.rglob("*") if p.suffix.lower() in {".html", ".htm"}]
+    )
+
+    for fpath in tqdm(files, desc="Processing HTML files"):
+        try:
+            url, title, blocks = process_html_file(fpath, max_words=max_words)
+        except Exception as e:
+            print(f"[WARN] Skipping {fpath}: {e}")
+            continue
+
+        if not blocks:
+            continue
+
+        doc_id = f"{fpath.stem}-{hash(str(fpath.resolve())) & 0xFFFFFFFF:x}"
+        ts = file_timestamp(fpath)
+
+        # Insert rows & collect texts for embedding
+        texts = [b["text"] for b in blocks]
+        # Small guard: empty text -> skip those blocks
+        valid = [(i, t) for i, t in enumerate(texts) if t and t.strip()]
+        if not valid:
+            continue
+
+        idxs, texts_valid = zip(*valid)
+        vecs = embedder.encode_passages(list(texts_valid), batch_size=batch_size)
+        vecs = normalize_vecs(vecs)
+
+        # Expand vecs back to full block list (skipping empties)
+        # We will add vectors in the same order we insert rows to keep row_id == vector_id
+        vec_cursor = 0
+        for i, b in enumerate(blocks):
+            if i in idxs:
+                v = vecs[vec_cursor]
+                all_vecs.append(v)
+                vec_cursor += 1
+                row = {
+                    "doc_id": doc_id,
+                    "url": url,
+                    "title": title,
+                    "block_id": b["block_id"],
+                    "parent_id": b["parent_id"],
+                    "children_ids": b["children_ids"],
+                    "block_path": b["block_path"],
+                    "html_clean": b["html_clean"],
+                    "text": b["text"],
+                    "headers": b["headers"],
+                    "token_estimate": b["token_estimate"],
+                    "timestamp": ts,
+                }
+                insert_block(conn, row)
+
+        conn.commit()
+        total_blocks += len(texts_valid)
+        total_files += 1
+
+    # Build FAISS
+    if all_vecs:
+        vec_mat = np.vstack(all_vecs).astype("float32")
+        index.add(vec_mat)
+        faiss.write_index(index, str(faiss_path))
+
+    # Stats
+    stats = {
+        "files_ingested": total_files,
+        "blocks_indexed": total_blocks,
+        "vector_dim": dim,
+        "faiss_index": str(faiss_path),
+        "sqlite_db": str(db_path),
+        "max_words_per_block": max_words,
+    }
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    conn.close()
+    print(f"Done. Files: {total_files}, blocks: {total_blocks}")
+    print(f"SQLite: {db_path}")
+    print(f"FAISS:  {faiss_path}")
+    print(f"Stats:  {stats_path}")
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Build a vector DB from cleaned, structure-aware HTML blocks.")
+    parser.add_argument("input_dir", type=str, help="Folder containing .html/.htm files")
+    parser.add_argument("--out", type=str, default="./vector_db", help="Output directory (FAISS + SQLite)")
+    parser.add_argument("--max_words", type=int, default=256, help="Max words per block (coarse block tree)")
+    parser.add_argument("--batch_size", type=int, default=64, help="Embedding batch size")
+    parser.add_argument("--device", type=str, default=None, help="Force device for SentenceTransformer (e.g., 'cpu', 'cuda')")
+    args = parser.parse_args()
+
+    build_vector_db(
+        input_dir=Path(args.input_dir),
+        out_dir=Path(args.out),
+        max_words=args.max_words,
+        batch_size=args.batch_size,
+        device=args.device,
+    )
+
+if __name__ == "__main__":
+    main()
+
+
+---
+
+What gets stored (per your schema)
+
+SQLite table blocks:
+
+doc_id, url, title
+
+block_id, parent_id, children_ids (JSON)
+
+block_path (e.g., <html1><body1><div2><p1>)
+
+html_clean (exact cleaned subtree HTML)
+
+text (plain text for embedding only)
+
+headers (JSON list of h1/h2 found inside the block)
+
+token_estimate (rough)
+
+timestamp (file mtime)
+
+
+FAISS holds one vector per SQLite row in the same order (so row_id equals FAISS vector id).
+
+
+---
+
+Notes & options
+
+The E5 family expects instruction prefixes; we use passage:  for all block texts.
+
+We L2-normalize embeddings and use IndexFlatIP → cosine similarity via inner product.
+
+The block tree is “coarse”: a node becomes a block if its full-subtree text ≤ max_words; otherwise we recurse to children, and finally chunk long leaf paragraphs.
+
+If you prefer Parquet/JSONL instead of SQLite, it’s a trivial swap in insert_block.
+
+If your pages are very large, consider raising --batch_size cautiously and running with --device cuda.
+
+
+Want a small script to search this DB (ANN + read metadata)? Say the word and I’ll add it.
