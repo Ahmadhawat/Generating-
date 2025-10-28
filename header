@@ -1,0 +1,14 @@
+# ---- around line 102 ----
+header = (
+    f"{INSTRUCTIONS}\n\n"
+    f"Frage: [{query}]\n\n"
+    f"Hinweis: {HINWEIS}\n\n"
+    f"Dateien:\n"
+)
+
+
+# ---- around line 116 ----
+block_header = (
+    f'file:{i}.\n'
+    f'Frage: [{query}] — Gib das SOURCE-PATH an, wenn du in dieser Datei die Antwort findest.\n'
+)
