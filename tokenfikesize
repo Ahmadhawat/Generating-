@@ -1,0 +1,61 @@
+import os
+import csv
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
+# === CONFIG ===
+# ⚙️ Change this path to your actual folder with text files
+input_dir = r"C:\Entwicklung\LAAAEntwicklung\KI\Generate\Daten\workspace\txt_files"
+output_csv = "file_token_sizes.csv"
+
+# Use the same tokenizer as your embedding model
+MODEL_NAME = "intfloat/multilingual-e5-base"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+
+# --- Helper function for E5 tokenization ---
+def count_tokens(text: str, as_query: bool = False) -> int:
+    """Tokenizes text using E5 tokenizer with appropriate prefix."""
+    prefix = "query: " if as_query else "passage: "
+    ids = tokenizer(prefix + text, add_special_tokens=True, truncation=False)["input_ids"]
+    return len(ids)
+
+# --- Collect token counts for all files ---
+file_token_data = []
+
+print(f"\n🔍 Scanning TXT files in: {input_dir}\n")
+
+for filename in tqdm(os.listdir(input_dir), desc="🧩 Processing files"):
+    if not filename.endswith(".txt"):
+        continue
+
+    file_path = os.path.join(input_dir, filename)
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+
+        if not text:
+            print(f"⚠️ Skipped empty file: {filename}")
+            continue
+
+        token_len = count_tokens(text, as_query=False)
+        file_token_data.append((filename, token_len))
+
+    except Exception as e:
+        print(f"❌ Error in {filename}: {e}")
+
+# --- Sort results by token count (descending) ---
+file_token_data.sort(key=lambda x: x[1], reverse=True)
+
+# --- Save as CSV ---
+with open(output_csv, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Filename", "Token Count"])
+    writer.writerows(file_token_data)
+
+print(f"\n✅ CSV file created: {output_csv}")
+print(f"📊 {len(file_token_data)} files processed.\n")
+
+# --- Optional: print a preview ---
+print("Top 10 largest files by token count:")
+for name, tokens in file_token_data[:10]:
+    print(f"{name:50s}  {tokens:>6} tokens")
