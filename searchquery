@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sqlite3
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+from tabulate import tabulate
+
+def normalize(vecs: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+    return vecs / norms
+
+class E5QueryEncoder:
+    def __init__(self, device=None):
+        self.model = SentenceTransformer("intfloat/multilingual-e5-base", device=device)
+    def encode(self, text: str) -> np.ndarray:
+        q = f"query: {text.strip() if text else ''}"
+        v = self.model.encode([q], convert_to_numpy=True, show_progress_bar=False)
+        return normalize(v.astype("float32"))
+
+def load_faiss(index_path: Path) -> faiss.Index:
+    if not index_path.exists():
+        raise FileNotFoundError(f"FAISS index not found at {index_path}")
+    return faiss.read_index(str(index_path))
+
+def open_sqlite(db_path: Path) -> sqlite3.Connection:
+    if not db_path.exists():
+        raise FileNotFoundError(f"SQLite DB not found at {db_path}")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def fetch_block_by_faiss_id(conn: sqlite3.Connection, faiss_id: int) -> sqlite3.Row:
+    """
+    Our ingest inserts rows sequentially; the FAISS vector ids follow the same
+    insertion order. SQLite rowid is 1-based, so rowid = faiss_id + 1.
+    """
+    rowid = faiss_id + 1
+    cur = conn.execute("SELECT rowid as row_id, * FROM blocks WHERE rowid = ?", (rowid,))
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"No SQLite row for FAISS id {faiss_id} (expected rowid {rowid})")
+    return row
+
+def ensure_alignment(conn: sqlite3.Connection, index: faiss.Index):
+    # Cheap sanity check that counts match.
+    cur = conn.execute("SELECT COUNT(*) AS c FROM blocks")
+    n_db = cur.fetchone()["c"]
+    n_ix = index.ntotal
+    if n_db != n_ix:
+        print(f"[WARN] Count mismatch: SQLite rows={n_db}, FAISS vectors={n_ix}. "
+              "If you deleted rows or rebuilt one side, re-run the builder to realign.")
+    return n_db, n_ix
+
+def truncate(s: str, n: int) -> str:
+    if s is None:
+        return ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+def save_html_hit(out_dir: Path, rank: int, row: sqlite3.Row):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fname = out_dir / f"hit_{rank:02d}_{row['doc_id']}_{row['block_id']}.html"
+    with open(fname, "w", encoding="utf-8") as f:
+        # Write a tiny wrapper with a title and the exact cleaned subtree
+        title = row["title"] or ""
+        f.write(f"<!doctype html><meta charset='utf-8'><title>{title}</title>\n")
+        f.write(row["html_clean"] or "")
+    return fname
+
+def search(db_dir: Path, query: str, k: int, device=None, save_html=False):
+    index_path = db_dir / "index.faiss"
+    db_path = db_dir / "metadata.db"
+
+    index = load_faiss(index_path)
+    conn = open_sqlite(db_path)
+    ensure_alignment(conn, index)
+
+    encoder = E5QueryEncoder(device=device)
+    qvec = encoder.encode(query)  # shape (1, d)
+
+    # FAISS search (inner product == cosine because we normalized)
+    scores, ids = index.search(qvec, k)
+    ids = ids[0].tolist()
+    scores = scores[0].tolist()
+
+    rows: List[sqlite3.Row] = []
+    for i, fid in enumerate(ids):
+        if fid < 0:
+            continue  # FAISS pads with -1 if not enough
+        row = fetch_block_by_faiss_id(conn, fid)
+        rows.append(row)
+
+    # Pretty table
+    table = []
+    for rank, (row, sc) in enumerate(zip(rows, scores), start=1):
+        headers_json = row["headers"] or "[]"
+        # compact headers display
+        hdr = truncate(headers_json.replace("\n", " "), 80)
+        table.append([
+            rank,
+            f"{sc:.3f}",
+            truncate(row["title"] or "", 60),
+            truncate(row["url"] or "", 60),
+            row["doc_id"],
+            row["block_id"],
+            truncate(row["block_path"] or "", 50),
+            truncate(row["text"] or "", 120),
+            row["token_estimate"],
+        ])
+
+    print(tabulate(
+        table,
+        headers=["#","score","title","url","doc_id","block_id","block_path","text_snippet","tokens"],
+        tablefmt="github"
+    ))
+
+    # Optionally dump HTMLs
+    if save_html:
+        saved = []
+        for rank, row in enumerate(rows, start=1):
+            p = save_html_hit(db_dir / "hits", rank, row)
+            saved.append(p)
+        print(f"\nSaved {len(saved)} HTML snippets in: {db_dir / 'hits'}")
+
+def main():
+    ap = argparse.ArgumentParser(description="Search the HTML vector DB (FAISS + SQLite).")
+    ap.add_argument("db_dir", type=str, help="Folder containing index.faiss and metadata.db")
+    ap.add_argument("--q", "--query", dest="query", required=True, help="Search query")
+    ap.add_argument("-k", type=int, default=5, help="Top-K results")
+    ap.add_argument("--device", type=str, default=None, help="Force device for SentenceTransformer (e.g., 'cpu', 'cuda')")
+    ap.add_argument("--save-html", action="store_true", help="Save cleaned HTML of each hit to db_dir/hits/")
+    args = ap.parse_args()
+
+    search(Path(args.db_dir), args.query, args.k, device=args.device, save_html=args.save_html)
+
+if __name__ == "__main__":
+    main()
