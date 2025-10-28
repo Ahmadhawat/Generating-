@@ -1,0 +1,328 @@
+Got it—here’s a self-contained generative answering script that:
+
+Loads your FAISS+SQLite DB
+
+Retrieves the first 30 blocks for a query using intfloat/multilingual-e5-base
+
+Wraps the exact cleaned HTML blocks plus tiny metadata into a lightweight <corpus> container (one <snippet> per block)
+
+Asks your LLM (via an OpenAI-compatible API) to answer, with snippet-ID/URL citations
+
+Keeps things under a configurable context limit (approximate token budget; no extra pruning)
+
+
+It reads settings (API base/key/model, DB path, top-K, etc.) from config.yaml (also below).
+
+
+---
+
+answer_with_html_corpus.py
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+import os
+import sqlite3
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import requests
+import yaml
+import faiss
+from sentence_transformers import SentenceTransformer
+
+# --------------------------
+# Utilities
+# --------------------------
+
+def normalize(vecs: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+    return vecs / norms
+
+def approx_token_count(text: str) -> int:
+    # Light heuristic (~1.3 words per token -> ~0.75 token per word); use 4 chars/token fallback
+    if not text:
+        return 0
+    # Prefer a simple char-based estimate; robust across languages
+    return max(1, int(len(text) / 4))
+
+def ensure_alignment(conn: sqlite3.Connection, index: faiss.Index):
+    cur = conn.execute("SELECT COUNT(*) AS c FROM blocks")
+    n_db = cur.fetchone()[0]
+    n_ix = index.ntotal
+    if n_db != n_ix:
+        print(f"[WARN] Row/vector mismatch (SQLite={n_db}, FAISS={n_ix}). "
+              f"Rebuild the DB to realign if search results look wrong.")
+    return n_db, n_ix
+
+# --------------------------
+# DB / Retrieval
+# --------------------------
+
+class E5QueryEncoder:
+    def __init__(self, device: Optional[str] = None):
+        self.model = SentenceTransformer("intfloat/multilingual-e5-base", device=device)
+
+    def encode(self, query: str) -> np.ndarray:
+        q = f"query: {query.strip() if query else ''}"
+        v = self.model.encode([q], convert_to_numpy=True, show_progress_bar=False)
+        return normalize(v.astype("float32"))
+
+def load_faiss(index_path: Path) -> faiss.Index:
+    if not index_path.exists():
+        raise FileNotFoundError(f"FAISS index not found at {index_path}")
+    return faiss.read_index(str(index_path))
+
+def open_sqlite(db_path: Path) -> sqlite3.Connection:
+    if not db_path.exists():
+        raise FileNotFoundError(f"SQLite DB not found at {db_path}")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def fetch_row_by_faiss_id(conn: sqlite3.Connection, fid: int) -> sqlite3.Row:
+    # Alignment rule from the builder: SQLite rowid = FAISS id + 1
+    rowid = fid + 1
+    cur = conn.execute("SELECT rowid as row_id, * FROM blocks WHERE rowid = ?", (rowid,))
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"No SQLite row for FAISS id {fid} (expected rowid {rowid})")
+    return row
+
+def retrieve_top_k(db_dir: Path, query: str, k: int, device: Optional[str]) -> List[sqlite3.Row]:
+    index = load_faiss(db_dir / "index.faiss")
+    conn = open_sqlite(db_dir / "metadata.db")
+    ensure_alignment(conn, index)
+
+    encoder = E5QueryEncoder(device=device)
+    qvec = encoder.encode(query)  # (1, d)
+
+    scores, ids = index.search(qvec, k)
+    ids = [i for i in ids[0].tolist() if i >= 0]
+
+    rows = [fetch_row_by_faiss_id(conn, fid) for fid in ids]
+    conn.close()
+    return rows
+
+# --------------------------
+# Prompt packaging
+# --------------------------
+
+def make_corpus_xml(snippets: List[sqlite3.Row]) -> str:
+    # Each snippet contains exact cleaned HTML inside CDATA to avoid escaping
+    parts = ["<corpus>"]
+    for rank, row in enumerate(snippets, start=1):
+        # Minimal metadata for citation & grounding
+        meta = {
+            "id": f"S{rank}",
+            "doc_id": row["doc_id"],
+            "block_id": row["block_id"],
+            "url": row["url"] or "",
+            "title": row["title"] or "",
+            "path": row["block_path"] or "",
+            "tokens": int(row["token_estimate"] or 0),
+        }
+        # CDATA with the exact cleaned HTML subtree
+        html_clean = row["html_clean"] or ""
+        parts.append(
+            f'<snippet id="{meta["id"]}" doc_id="{meta["doc_id"]}" block_id="{meta["block_id"]}" '
+            f'url="{meta["url"]}" title="{meta["title"].replace("\"","\'")}" '
+            f'path="{meta["path"].replace("\"","\'")}" tokens="{meta["tokens"]}">\n'
+            f"<![CDATA[\n{html_clean}\n]]>\n</snippet>"
+        )
+    parts.append("</corpus>")
+    return "\n".join(parts)
+
+def build_messages(corpus_xml: str, question: str, language_hint: Optional[str] = None) -> List[Dict]:
+    # System prompt keeps it tight; instructs citation style with snippet IDs
+    system = (
+        "You are a careful assistant. Answer ONLY using facts from the provided <corpus> snippets. "
+        "When you state a fact, add citations in square brackets like [S3] or [S2,S5]. "
+        "If unsure, say you don't know. Prefer concise answers. "
+        "If the question appears in German, answer in German; otherwise, answer in the question's language."
+    )
+    user = (
+        f"{corpus_xml}\n\n"
+        f"Question: {question}\n\n"
+        "Guidelines:\n"
+        "1) Base your answer ONLY on the snippets above (the HTML inside each <snippet> is ground truth).\n"
+        "2) Add citations using the snippet id(s), e.g., [S1] or [S1,S4].\n"
+        "3) If useful, you may quote short phrases, but keep quotes brief.\n"
+        "4) If multiple snippets conflict, say so and cite both.\n"
+        "5) Keep formatting simple (bullet points or brief paragraphs)."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+# --------------------------
+# Context budgeting
+# --------------------------
+
+def fit_to_context(snippets: List[sqlite3.Row], question: str, context_window: int, max_output_tokens: int, safety_margin: int = 1000) -> List[sqlite3.Row]:
+    """
+    We add snippets in order until the approx prompt tokens would exceed the context window
+    (leaving room for output + a small safety margin). No semantic pruning is performed.
+    """
+    chosen = []
+    # Base overhead: system+instructions + question wrapper
+    overhead_text = (
+        "You are a careful assistant. Answer ONLY using facts from the provided <corpus> snippets. "
+        "When you state a fact, add citations in square brackets like [S3] or [S2,S5]. "
+        "If unsure, say you don't know. Prefer concise answers."
+        + "Question:" + question
+    )
+    overhead_tokens = approx_token_count(overhead_text)
+    budget = max(1, context_window - max_output_tokens - safety_margin - overhead_tokens)
+
+    used = 0
+    for row in snippets:
+        # Approximate cost of wrapping + HTML body
+        html_clean = row["html_clean"] or ""
+        meta_str = f'{row["doc_id"]}{row["block_id"]}{row["url"]}{row["title"]}{row["block_path"]}'
+        snippet_tokens = approx_token_count(html_clean) + approx_token_count(meta_str) + 50  # wrapper overhead
+        if used + snippet_tokens > budget:
+            break
+        chosen.append(row)
+        used += snippet_tokens
+
+    return chosen
+
+# --------------------------
+# LLM call (OpenAI-compatible)
+# --------------------------
+
+def call_llm(api_base: str, api_key: str, model: str, messages: List[Dict], temperature: float, max_output_tokens: int, extra_headers: Optional[Dict] = None) -> str:
+    url = api_base.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+        "max_tokens": int(max_output_tokens),
+    }
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
+    if resp.status_code >= 300:
+        raise RuntimeError(f"LLM API error {resp.status_code}: {resp.text}")
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+# --------------------------
+# Main
+# --------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="Generative QA over retrieved HTML snippets (first 30), no pruning beyond context fit.")
+    ap.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
+    ap.add_argument("--q", "--query", dest="query", required=True, help="User question")
+    ap.add_argument("--save-prompt", type=str, default=None, help="Optional path to save the final prompt (corpus XML) sent to the model")
+    ap.add_argument("--save-answer", type=str, default=None, help="Optional path to save the model answer")
+    args = ap.parse_args()
+
+    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+
+    db_dir = Path(cfg["db"]["dir"])
+    top_k = int(cfg.get("retrieval", {}).get("top_k", 30))
+    device = cfg.get("retrieval", {}).get("device")
+
+    api_base = cfg["llm"]["api_base"]
+    api_key = cfg["llm"]["api_key"]
+    model = cfg["llm"]["model"]
+    temperature = float(cfg["llm"].get("temperature", 0.2))
+    max_output_tokens = int(cfg["llm"].get("max_output_tokens", 800))
+    context_window = int(cfg["llm"].get("context_window", 120000))
+    extra_headers = cfg["llm"].get("extra_headers")  # e.g., for Azure/OpenRouter
+
+    # 1) Retrieve first 30 (or fewer) by ANN
+    raw_snippets = retrieve_top_k(db_dir, args.query, k=top_k, device=device)
+
+    if not raw_snippets:
+        print("No results found.")
+        return
+
+    # 2) Enforce context window (approximate) — no semantic pruning
+    chosen = fit_to_context(
+        raw_snippets, args.query,
+        context_window=context_window,
+        max_output_tokens=max_output_tokens,
+        safety_margin=cfg["llm"].get("safety_margin", 1000)
+    )
+
+    # 3) Build corpus container and messages
+    corpus_xml = make_corpus_xml(chosen)
+    messages = build_messages(corpus_xml, args.query)
+
+    # Optional: save prompt
+    if args.save_prompt:
+        Path(args.save_prompt).write_text(corpus_xml, encoding="utf-8")
+        print(f"Saved prompt corpus to: {args.save_prompt}")
+
+    # 4) Call LLM
+    answer = call_llm(
+        api_base=api_base,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        extra_headers=extra_headers
+    )
+
+    # Print & optionally save
+    print("\n===== ANSWER =====\n")
+    print(answer)
+    if args.save_answer:
+        Path(args.save_answer).write_text(answer, encoding="utf-8")
+        print(f"\nSaved answer to: {args.save_answer}")
+
+if __name__ == "__main__":
+    main()
+
+
+---
+
+config.yaml (example)
+
+# LLM settings (OpenAI-compatible /chat/completions endpoint)
+llm:
+  api_base: "https://api.openai.com/v1"   # or your gateway, e.g., "https://api.openrouter.ai/v1"
+  api_key: "REPLACE_WITH_YOUR_KEY"
+  model: "gpt-4o-mini"                    # any chat model that handles long context
+  temperature: 0.2
+  max_output_tokens: 800
+  context_window: 120000                  # conservative default; set to your model's limit
+  # Optional: pass extra HTTP headers (e.g., for provider-specific keys)
+  # extra_headers:
+  #   HTTP-Referer: "https://your-app.example"
+  #   X-Title: "Your App"
+  safety_margin: 1000                     # keep some room in the prompt
+
+# Where the FAISS index + SQLite live (built by your indexer)
+db:
+  dir: "./vector_db"
+
+# Retrieval
+retrieval:
+  top_k: 30
+  device: null   # "cpu" or "cuda" for sentence-transformers
+
+
+---
+
+How to run
+
+pip install sentence-transformers faiss-cpu numpy pyyaml requests
+python answer_with_html_corpus.py --config config.yaml --q "Worum geht es in Abschnitt 4 der Richtlinie?"
+# optionally store artifacts:
+python answer_with_html_corpus.py --config config.yaml --q "Kündigungsfrist laut Vertrag?" \
+  --save-prompt prompt_corpus.xml --save-answer answer.txt
+
+What it sends to the model: an XML-like <corpus> containing up to 30 <snippet> blocks, each wrapping the exact cleaned HTML (inside CDATA) plus metadata (id, url, title, doc_id, block_id, path, tokens). The user message includes your question and short guidelines on how to cite like [S3].
+
+If you want, I can add a variant that streams tokens from the LLM for interactive UIs.
