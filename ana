@@ -1,0 +1,131 @@
+import os
+import json
+import csv
+from collections import defaultdict
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer
+
+# === CONFIG ===
+# ⚙️ Change to your folder with .txt files
+input_dir = r"C:\Entwicklung\LAAAEntwicklung\KI\Generate\Daten\workspace\txt_files"
+
+# Use the E5 model tokenizer
+MODEL_NAME = "intfloat/multilingual-e5-base"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+
+# === Token count buckets ===
+token_buckets = {
+    "≤50": 0,
+    "≤100": 0,
+    "≤512": 0,
+    "≤1024": 0,
+    "≤2048": 0,
+    ">2048": 0,
+}
+
+token_counts = []
+file_count = 0
+total_tokens = 0
+min_tokens = float("inf")
+max_tokens = 0
+
+print(f"\n🔍 Scanning TXT files in: {input_dir}\n")
+
+# --- helper for E5 tokenizer ---
+def count_tokens(text: str, as_query: bool = False) -> int:
+    """Tokenizes text using E5 tokenizer with proper prefix."""
+    prefix = "query: " if as_query else "passage: "
+    ids = tokenizer(prefix + text, add_special_tokens=True, truncation=False)["input_ids"]
+    return len(ids)
+
+# === MAIN LOOP ===
+for filename in tqdm(os.listdir(input_dir), desc="🧩 Processing files"):
+    if not filename.endswith(".txt"):
+        continue
+
+    file_path = os.path.join(input_dir, filename)
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+
+        if not text:
+            print(f"⚠️ Skipped empty file: {filename}")
+            continue
+
+        token_len = count_tokens(text, as_query=False)
+
+        token_counts.append(token_len)
+        total_tokens += token_len
+        file_count += 1
+        min_tokens = min(min_tokens, token_len)
+        max_tokens = max(max_tokens, token_len)
+
+        # --- Bucket assignment ---
+        if token_len <= 50:
+            token_buckets["≤50"] += 1
+        elif token_len <= 100:
+            token_buckets["≤100"] += 1
+        elif token_len <= 512:
+            token_buckets["≤512"] += 1
+        elif token_len <= 1024:
+            token_buckets["≤1024"] += 1
+        elif token_len <= 2048:
+            token_buckets["≤2048"] += 1
+        else:
+            token_buckets[">2048"] += 1
+
+    except Exception as e:
+        print(f"❌ Error in {filename}: {e}")
+
+# === SUMMARY ===
+avg_tokens = total_tokens / file_count if file_count else 0
+suggested_chunk = 512
+overlap = int(0.1 * suggested_chunk)
+
+print("\n=== 📊 Token Count Stats ===")
+print(f"Files processed       : {file_count}")
+print(f"Min tokens/file       : {min_tokens}")
+print(f"Max tokens/file       : {max_tokens}")
+print(f"Average tokens/file   : {avg_tokens:.2f}")
+print(f"Suggested chunk size  : {suggested_chunk} tokens (with ~{overlap} overlap)")
+
+print("\n=== 📦 Token Count Buckets ===")
+for bucket, count in token_buckets.items():
+    percent = (count / file_count) * 100 if file_count else 0
+    print(f"{bucket:>8}: {count:5} files ({percent:5.1f}%)")
+
+# === EXPORT CSV ===
+csv_path = "token_distribution.csv"
+with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Token Range", "File Count", "Percentage"])
+    for bucket, count in token_buckets.items():
+        percent = (count / file_count) * 100 if file_count else 0
+        writer.writerow([bucket, count, f"{percent:.2f}"])
+print(f"\n📁 CSV saved to: {csv_path}")
+
+# === EXPORT JSON ===
+json_path = "token_distribution.json"
+with open(json_path, "w", encoding="utf-8") as f:
+    json.dump({
+        "total_files": file_count,
+        "min_tokens": min_tokens,
+        "max_tokens": max_tokens,
+        "avg_tokens": avg_tokens,
+        "buckets": token_buckets
+    }, f, indent=2, ensure_ascii=False)
+print(f"📁 JSON saved to: {json_path}")
+
+# === PLOT HISTOGRAM ===
+plt.figure(figsize=(10, 6))
+plt.hist(token_counts, bins=50, color='skyblue', edgecolor='black')
+plt.axvline(suggested_chunk, color='green', linestyle='--',
+            label=f"Chunk Size ({suggested_chunk})")
+plt.title("Token Count Distribution (TXT Files)")
+plt.xlabel("Token Count")
+plt.ylabel("Number of Files")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
