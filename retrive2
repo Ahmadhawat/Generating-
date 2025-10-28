@@ -1,0 +1,292 @@
+Got it—below is a self-contained generative stage that:
+
+reads top 30 retrieved blocks from your FAISS+SQLite DB,
+
+wraps the exact cleaned HTML + tiny metadata in a lightweight container,
+
+asks your LLM the user’s question,
+
+and instructs the model to cite sources with URLs (Perplexity-style).
+
+
+It uses a generic OpenAI-compatible Chat API (URL/key/model pulled from config.yaml).
+No pruning beyond staying under a configurable prompt char budget.
+
+
+---
+
+config.yaml
+
+# LLM and prompt controls
+llm:
+  api_url: "https://api.openai.com/v1/chat/completions"  # any OpenAI-compatible endpoint
+  api_key: "YOUR_API_KEY_HERE"
+  model: "gpt-4o-mini"        # or another chat model your endpoint supports
+  max_output_tokens: 700      # model response tokens (adjust as needed)
+
+prompt:
+  max_prompt_chars: 200000    # hard cap to avoid overfilling the context
+  max_snippets: 30            # take first 30 retrieved blocks
+  max_chars_per_snippet: 6000 # trim any single HTML block if necessary
+  system_message: |
+    You are a careful research assistant. Answer using only the provided HTML snippets.
+    When you make a claim, add bracket citations like [1], [2] that refer to the
+    snippet ids. After your answer, include a "Sources" section listing each id and URL.
+    Do not invent sources. Do not convert HTML to markdown; you may read it as-is.
+
+# Paths
+db:
+  root: "./vector_db"         # folder containing index.faiss and metadata.db
+
+# Embeddings (for query encoding)
+embeddings:
+  model: "intfloat/multilingual-e5-base"
+  device: null                # "cuda" or "cpu" (null = auto)
+
+
+---
+
+generate_answer.py
+
+#!/usr/bin/env python3
+"""
+Generative stage for HTML-RAG:
+- Load FAISS + SQLite vector DB
+- Retrieve top-N (default 30) blocks for a query
+- Build a single prompt containing exact cleaned HTML blocks with tiny metadata
+- Call an OpenAI-compatible Chat API to generate an answer with bracketed citations and source URLs
+
+Usage:
+  pip install pyyaml sentence-transformers faiss-cpu numpy requests tabulate
+  python generate_answer.py --query "Worauf muss ich bei der Kündigungsfrist achten?"
+
+Optionally pass:
+  --config ./config.yaml
+"""
+
+import argparse
+import json
+import sqlite3
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+import numpy as np
+import requests
+import yaml
+import faiss
+from sentence_transformers import SentenceTransformer
+
+# ----------------------------
+# Embedding (E5 Query)
+# ----------------------------
+def l2_normalize(vecs: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
+    return vecs / norms
+
+class E5QueryEncoder:
+    def __init__(self, model_name: str, device=None):
+        self.model = SentenceTransformer(model_name, device=device)
+
+    def encode(self, query: str) -> np.ndarray:
+        q = f"query: {query.strip()}"
+        v = self.model.encode([q], convert_to_numpy=True, show_progress_bar=False)
+        v = v.astype("float32")
+        return l2_normalize(v)
+
+# ----------------------------
+# Vector DB access
+# ----------------------------
+def load_index(index_path: Path) -> faiss.Index:
+    if not index_path.exists():
+        raise FileNotFoundError(f"FAISS index not found at {index_path}")
+    return faiss.read_index(str(index_path))
+
+def open_db(db_path: Path) -> sqlite3.Connection:
+    if not db_path.exists():
+        raise FileNotFoundError(f"SQLite DB not found at {db_path}")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def fetch_rows_for_ids(conn: sqlite3.Connection, ids: List[int]) -> List[sqlite3.Row]:
+    rows = []
+    for fid in ids:
+        if fid < 0:
+            continue
+        # rowid is 1-based; we inserted rows sequentially during indexing
+        rowid = fid + 1
+        cur = conn.execute("SELECT rowid as row_id, * FROM blocks WHERE rowid = ?", (rowid,))
+        r = cur.fetchone()
+        if r:
+            rows.append(r)
+    return rows
+
+def ann_search(db_root: Path, query_vec: np.ndarray, topk: int) -> Tuple[List[int], List[float]]:
+    index = load_index(db_root / "index.faiss")
+    # sanity check against DB row count
+    conn = open_db(db_root / "metadata.db")
+    nrows = conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+    if index.ntotal != nrows:
+        print(f"[WARN] FAISS vectors ({index.ntotal}) != SQLite rows ({nrows}). Consider rebuilding.")
+    scores, ids = index.search(query_vec, topk)
+    return ids[0].tolist(), scores[0].tolist()
+
+# ----------------------------
+# Prompt assembly
+# ----------------------------
+def clamp_text(s: str, max_chars: int) -> str:
+    s = s or ""
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 1] + "…"
+
+def build_container(snippets: List[sqlite3.Row], max_chars_per_snippet: int, max_prompt_chars: int, user_query: str) -> str:
+    """
+    Build a single prompt with:
+      - User question
+      - Container of <snippet id="..."> with exact cleaned HTML and tiny metadata
+    """
+    head = (
+        "<query>\n"
+        f"{user_query.strip()}\n"
+        "</query>\n\n"
+        "<context>\n"
+    )
+    parts = [head]
+    total = len(head)
+
+    for rank, row in enumerate(snippets, start=1):
+        html_clean = clamp_text(row["html_clean"] or "", max_chars_per_snippet)
+        url = row["url"] or ""
+        title = row["title"] or ""
+        block_path = row["block_path"] or ""
+        snippet = (
+            f'<snippet id="{rank}" url="{url}" title="{title}" path="{block_path}">\n'
+            "<!--BEGIN_HTML-->\n"
+            f"{html_clean}\n"
+            "<!--END_HTML-->\n"
+            "</snippet>\n\n"
+        )
+        if total + len(snippet) > max_prompt_chars:
+            break
+        parts.append(snippet)
+        total += len(snippet)
+
+    parts.append("</context>\n\n")
+    parts.append(
+        "Instructions:\n"
+        "- Answer the user's question using ONLY the HTML in <context>.\n"
+        "- Add bracket citations like [1], [2] that map to snippet ids.\n"
+        "- After your answer, include a 'Sources' section with each id and URL (e.g., [1] https://...).\n"
+        "- If something is unknown, say so rather than guessing.\n"
+    )
+    return "".join(parts)
+
+# ----------------------------
+# LLM call (OpenAI-compatible)
+# ----------------------------
+def call_llm(api_url: str, api_key: str, model: str, system_msg: str, user_prompt: str, max_output_tokens: int) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_output_tokens,
+        "temperature": 0.2,
+    }
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=120)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"LLM API error {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    # OpenAI-style
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Generative HTML-RAG over top HTML blocks with source URLs.")
+    ap.add_argument("--query", required=True, help="User question")
+    ap.add_argument("--config", default="./config.yaml", help="Path to config.yaml")
+    args = ap.parse_args()
+
+    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+
+    # config
+    db_root = Path(cfg["db"]["root"])
+    max_snippets = int(cfg["prompt"]["max_snippets"])
+    max_chars_per_snippet = int(cfg["prompt"]["max_chars_per_snippet"])
+    max_prompt_chars = int(cfg["prompt"]["max_prompt_chars"])
+    system_msg = cfg["prompt"]["system_message"]
+
+    api_url = cfg["llm"]["api_url"]
+    api_key = cfg["llm"]["api_key"]
+    model = cfg["llm"]["model"]
+    max_output_tokens = int(cfg["llm"]["max_output_tokens"])
+
+    # embeddings
+    emb_model = cfg["embeddings"]["model"]
+    emb_device = cfg["embeddings"]["device"]
+
+    # 1) Encode query
+    encoder = E5QueryEncoder(emb_model, device=emb_device)
+    qvec = encoder.encode(args.query)
+
+    # 2) Retrieve top-N ids
+    ids, scores = ann_search(db_root, qvec, topk=max_snippets)
+
+    # 3) Load rows
+    conn = open_db(db_root / "metadata.db")
+    rows = fetch_rows_for_ids(conn, ids)
+
+    if not rows:
+        print("No results found.")
+        return
+
+    # 4) Build prompt container with exact cleaned HTML
+    user_prompt = build_container(
+        rows,
+        max_chars_per_snippet=max_chars_per_snippet,
+        max_prompt_chars=max_prompt_chars,
+        user_query=args.query,
+    )
+
+    # 5) Call LLM
+    answer = call_llm(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        system_msg=system_msg,
+        user_prompt=user_prompt,
+        max_output_tokens=max_output_tokens,
+    )
+
+    # 6) Print the model’s answer (should include bracket citations + a Sources list with URLs)
+    print(answer)
+
+if __name__ == "__main__":
+    main()
+
+
+---
+
+Notes
+
+Exact HTML preserved: the prompt embeds the html_clean from your DB unmodified, inside <snippet> containers with id, title, path, and URL so the model can cite accurately.
+
+Perplexity-style citations: the system/user instructions tell the model to use bracket citations [n] and a “Sources” section listing each URL. (Your DB rows must have url filled; the builder script already sets it via <link rel="canonical"> or file URI fallback.)
+
+Context safety: to avoid overruns, snippets are trimmed to max_chars_per_snippet, and the whole prompt is capped by max_prompt_chars. There’s no relevance pruning beyond that cap, per your request.
+
+Any OpenAI-compatible endpoint: works with OpenAI, Azure OpenAI (adjust URL), or OpenRouter—the YAML keeps this flexible.
+
+
+If you want, I can also add a tiny CLI flag to dump the assembled prompt to a file for debugging.
